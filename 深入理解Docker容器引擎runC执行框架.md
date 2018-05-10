@@ -4,7 +4,7 @@
 
 根据官方的定义：runC是一个根据OCI标准创建并运行容器的CLI tool。
 
-Docker就是基于runC创建的，简单地说，runC就是Docker中最为核心的部分，容器的创建，运行，销毁等等操作最终都将通过调用runc完成。而runC也有自己的客户端，下面我们将演示如何使用runC，以最精简的方式创建并运行一个容器。
+Docker就是基于runC创建的，简单地说，runC是Docker中最为核心的部分，容器的创建，运行，销毁等等操作最终都将通过调用runC完成。而runC也有自己的客户端，下面我们将演示如何使用runC，以最精简的方式创建并运行一个容器。
 
 
 
@@ -61,7 +61,7 @@ ID              PID         STATUS      BUNDLE         CREATED                  
 mycontainerid   1070        running     /mycontainer   2017-12-20T12:26:30.159978871Z   root
 ```
 
-事实上，"runc run"是一个复合命令，它包含了容器的创建（runc create），启动（runc start）以及在退出之后对容器进行的销毁（runc delete），从演示的角度看它是最为直观的。但是如果想要深入理解runC内部的实现机制，将容器的创建，启动，销毁三个步骤分开，显然会让整个过程的分析更为简单和易于接受
+事实上，`runc run`是一个复合命令，它包含了容器的创建`runc create`，启动`runc start`以及在退出之后对容器进行的销毁`runc delete`，从演示的角度看它是最为直观的。但是如果想要深入理解runC内部的实现机制，将容器的创建，启动，销毁三个步骤分开，显然会让整个过程的分析更为简单和易于接受
 
 下面我们就将结合源码，对整个容器技术最为核心的部分进行探究—— 容器是如何创建并启动的
 
@@ -93,9 +93,9 @@ mycontainerid   1070        running     /mycontainer   2017-12-20T12:26:30.15997
 ......
 ```
 
-可以看到在runC的顶层目录中，有着一系列形如`create.go`, `start.go`, `run.go`...的go文件，它们和runC的子命令，例如`runc create...`，`runc start...`是一致的。 另外，在顶层目录中还有一个名为`libcontainer`的子目录。对于Docker项目的发展历史有所了解的同学应该都知道，`libcontainer`曾经是Docker中最为核心的包，容器的创建，删除等一系列工作，最终都是交由它来完成的。
+可以看到在runC的顶层目录中，有着一系列形如`create.go`, `start.go`, `run.go`...的go文件，它们和runC的子命令，例如`runc create...`，`runc start...`，`runc run`是一致的。 另外，在顶层目录中还有一个名为`libcontainer`的子目录。对于Docker项目的发展历史有所了解的同学应该都知道，`libcontainer`曾经是Docker中最为核心的包，容器的创建，删除等一系列工作，最终都是交由它来完成的。
 
-这样一来，runC的代码结构就非常清晰了。我们知道，runC是符合OCI标准的容器运行时。不难猜出，它本质上是对`libcontainer`的一层薄薄的封装。它会先读取符合OCI标准的容器配置，再将其转换成与`libcontainer`兼容的配置格式，最后将配置交由`libcontainer`来完成具体的工作。
+这样一来，runC的代码结构就非常清晰了。我们知道，runC是符合OCI标准的容器运行时。不难猜出，它本质上是对`libcontainer`的一层薄薄的封装。它会先读取符合OCI标准的容器配置，再将其转换成与`libcontainer`兼容的格式，最后将转换后的配置交由`libcontainer`来完成具体的工作。
 
 
 
@@ -113,7 +113,7 @@ status, err := startContainer(context, spec, CT_ACT_CREATE, nil)
 create.go的工作主要分为如下两部分：
 
 1. 将容器配置从config.json文件加载到内存中，保存在一个类型为[*specs.Spec](https://github.com/opencontainers/runtime-spec/blob/master/specs-go/config.go#L5) (Spec即为OCI标准的容器配置在内存中的表现形式)的结构体中
-2. 调用`startContainer()`完成容器的创建工作，值得注意的是`runc run` , `runc create`以及`runc restore`最终都将调用该函数，只是第三个参数不同而已，对于`runc create`，该参数为`CT_ACT_CREATE`，表示第一次创建容器。接下来程序的执行路径将因该参数的不同而有所不同。
+2. 调用`startContainer()`完成容器的创建工作，值得注意的是`runc run` , `runc create`以及`runc restore`最终都将调用该函数，只是第三个参数不同而已，对于`runc create`，该参数为`CT_ACT_CREATE`，表示首次创建容器。接下来程序的执行路径将因该参数的不同而有所不同。
 
 ```go
 // runc/utils_linux.go
@@ -186,7 +186,7 @@ func (r *runner) run(config *specs.Process) (int, error) {
 2. 调用`setupIO`对进程的IO进行配置，因为IO涉及的内容较为复杂，会在另外的文章中详细叙述
 3. 根据`startContainer`配置参数的不同，调用不同的方法，分别进行容器的创建，运行或者恢复，本文我们只讨论`CT_ACT_CREATE`这种情况
 
-到此为止，我们已经将OCI格式的配置，不管是Container还是Process都已经转换为`libcontainer`要求的格式了。接着我们将深入`libcontainer`，真正完成容器实例的创建工作。
+到此为止，我们已经将OCI格式的配置，不管是Container还是Process都转换成了`libcontainer`要求的格式。接着我们将深入`libcontainer`，真正完成容器实例的创建工作。
 
 ```go
 // runc/libcontainer/container_linux.go
@@ -211,9 +211,9 @@ func (c *linuxContainer) Start(process *Process) error {
 }
 ```
 
-`Start`函数仅仅只是对`start`的一个封装并且会在容器状态为`Stopped`时（即新建容器时），创建一个路径为`/run/runc/$ID/exec.fifo`的管道文件，它的作用我们会在后文中详细描述。
+`Start`方法仅仅只是对`start`的一个封装并且会在容器状态为`Stopped`时（即新建容器时），创建一个路径为`/run/runc/$ID/exec.fifo`的管道文件，它的作用我们会在后文中详细描述。
 
-值得注意的是`start`函数的第二个参数对容器的状态进行了判断，事实上，命令`runc create`和`runc exec`的执行流程是类似的，并且共享了大部分的代码。因此，这里我们需要对容器的状态进行判断，如果容器的状态为`Stopped`说明接下来应当进行容器的创建，否则应当在已有容器中exec一个新进程。
+值得注意的是`start`方法的第二个参数对容器的状态进行了判断。事实上，命令`runc create`和`runc exec`的代码的执行路径是类似的，它俩共享了大部分的代码。因此，这里我们需要对容器的状态进行判断，如果容器的状态为`Stopped`说明接下来应当进行容器的创建，否则应当在已有容器中exec一个新进程。
 
 ```go
 // runc/libcontainer/container_linux.go
@@ -258,7 +258,7 @@ func (c *linuxContainer) start(process *Process, isInit bool) error {
 }
 ```
 
-`start`函数的工作也可以分为如下三部分：
+`start`方法的工作也可以分为如下三部分：
 
 1. 调用`newParentProcess`创建`parentProcess`	对象
 2. 调用`parentProcess`的`start`方法，它真正完成容器进程的创建以及初始化工作
@@ -307,11 +307,11 @@ func (c *linuxContainer) commandTemplate(p *Process, childPipe *os.File) (*exec.
 }
 ```
 
-从上面的代码中我们可以看出，环境变量也是runC进程和容器初始化进程之间进行交互的一种重要方式。上文中的`init` 这个管道的信息就是通过环境变量的方式从runC传递给容器初始化进程的。
+从上面的代码中我们可以看出，环境变量也是runC进程和容器初始化进程之间进行交互的一种重要方式。上文中的`init` 管道的信息就是通过环境变量的方式从runC传递给容器初始化进程的。
 
 到这里，我们脑海中可能会浮现出另一个问题：`c.initPath`应该就是容器初始化进程的二进制文件的路径，那么它是一个独立于runC的二进制文件么？它又是放在哪的呢？事实上，`c.initPath`在上文初始化Container对象时会被初始化为`/proc/self/exe`，而`c.initArgs`被设置为`init` ，因此我们创建子进程的过程其实相当于执行了`runc init`这条命令。
 
-如果执行的命令为`runc create`，还需要将前文提到的`exec.fifo`这个管道同样以环境变量的形式传递到容器初始化进程中。最后，调用`newInitProcess`将配置都填充至结构体`initProcess`中。
+如果执行的命令为`runc create`，还需要将前文提到的`exec.fifo`这个管道同样以环境变量的形式传递到容器初始化进程中。最后，调用`newInitProcess`将所有配置都填充至结构体`initProcess`中。
 
 ```go
 // runc/libcontainer/process_linux.go
@@ -381,7 +381,7 @@ func (p *initProcess) start() error {
 }
 ```
 
-`initProcess`结构的`start`方法真正完成了容器进程的创建，并通过init管道协助其完成初始化工作。该函数首先调用`p.cmd.Start()`创建一个独立的进程运行命令`runc init`。接着通过init管道将容器配置`p.bootstrapData`写入管道中。然后再调用`parseSync()`函数，通过init管道与容器初始化进程进行同步，待其初始化完成之后，执行`PreStart Hook`等一些回调操作。最后，关闭init管道，容器创建完成。
+`initProcess`结构的`start`方法真正完成了容器进程的创建，并通过`init`管道协助其完成初始化工作。该方法首先调用`p.cmd.Start()`创建一个独立的进程，执行命令`runc init`。接着通过`init`管道将容器配置`p.bootstrapData`写入管道中。然后再调用`parseSync()`函数，通过`init`管道与容器初始化进程进行同步，待其初始化完成之后，执行`PreStart Hook`等一些回调操作。最后，关闭`init`管道，容器创建完成。
 
 runC端在创建容器时所做的工作我们已经基本了解了，下面我们来看看`runc init`，也就是容器初始化进程具体完成了哪些工作。
 
@@ -427,7 +427,7 @@ func (l *LinuxFactory) StartInitialization() (err error) {
 }
 ```
 
-作为容器的初始化进程，必须先通过init管道获取配置才能进行下一步的工作。显然，我们首先要做的就是从环境变量中获取与runC进程进行交互的管道的信息，包括init管道。对于`runc create`还有管道`exec.fifo`，即上方代码中的`fifofd`。紧接着，调用函数`newContainerInit`，创建用于初始化的接口对象`initer`，该函数的代码如下：
+作为容器的初始化进程，必须先通过`init`管道获取配置才能进行下一步的工作。显然，我们首先要做的就是从环境变量中获取与runC进程进行交互的管道的信息，包括`init`管道。对于`runc create`还有管道`exec.fifo`，即上方代码中的`fifofd`。紧接着，调用函数`newContainerInit`，创建用于初始化的接口对象`initer`，该函数的代码如下：
 
 ```go
 // runc/libcontainer/init_linux.go
@@ -458,7 +458,7 @@ func newContainerInit(t initType, pipe *os.File, consoleSocket *os.File, fifoFd 
 }
 ```
 
-该函数的作用非常明显，从init管道中读取容器配置，解析至`initConfig`中。对于`runc create`，创建`linuxStandardInit`结构，将各种配置信息写入其中。最后，调用该结构的`Init`方法真正对容器进行初始化。
+该函数的作用非常明显，从`init`管道中读取容器配置，解析至`initConfig`中。对于`runc create`，创建`linuxStandardInit`结构，将各种配置信息写入其中。最后，调用该结构的`Init`方法真正对容器进行初始化。
 
 ```go
 // runc/libcontainer/standard_init_linux.go
@@ -507,7 +507,7 @@ func (l *linuxStandardInit) Init() error {
 }
 ```
 
-`Init`函数真正完成了对容器的初始化工作，它会对容器的网络，路由，hostname等一系列属性进行配置。这些工作一般都是直接通过系统调用设置完成的，因此我们就不再细述了。接下来我们将重点描述容器初始化进程和其父进程，也就是runC进程的同步过程。
+`Init`方法真正完成了对容器的初始化工作，它会对容器的网络，路由，hostname等一系列属性进行配置。这些工作一般都是直接通过系统调用设置完成的，因此我们就不再细述了。接下来我们将重点描述容器初始化进程和其父进程，也就是runC进程的同步过程。
 
 我们都知道，每个容器都有自己的根文件系统，到目前为止我们依然还是宿主机文件系统的视角，那么文件系统根目录的切换是在哪里进行的呢？答案是显然的，`prepareRootfs`。
 
@@ -533,11 +533,11 @@ func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
 	return nil
 ```
 
-`prepareRootfs`首先对容器的Mounts和Dev等信息进行配置，之后再调用`syncParentHooks`，通过init管道向runC进程发送`procHooks`信号。runC进程接收到`procHooks`信号之后，执行容器的`PreStart Hook`回调函数，再通过init管道给容器初始化进程发送信号`procResume`，通知其继续执行。可见容器的`PreStart Hook`是在根目录尚未切换之前执行完成的。最终，调用`chroot`函数，切换根目录。至此，容器的文件系统切换完毕。
+`prepareRootfs`先对容器的Mounts和Dev等信息进行配置，之后再调用`syncParentHooks`，通过`init`管道向runC进程发送`procHooks`信号。runC进程接收到`procHooks`信号之后，执行容器的`PreStart Hook`回调函数，再通过`init`管道给容器初始化进程发送信号`procResume`，通知其继续执行。可见容器的`PreStart Hook`是在根目录尚未切换之前执行完成的。最终，调用`chroot`函数，切换根目录。至此，容器的文件系统切换完毕。
 
-在文件系统准备完成之后，`Init`函数还会对Console, hostname等内容进行配置。当一切就绪之后，调用`syncParentReady`通过init管道通知runC进程，获取响应之后，关闭init管道，同步结束，准备开始执行用户指定的容器进程。
+在文件系统准备完成之后，`Init`方法还会对Console, hostname等属性进行配置。当一切就绪之后，调用`syncParentReady`通过`init`管道通知runC进程，获取响应之后，关闭`init`管道，同步结束，准备开始执行用户指定的容器进程。
 
-不过在找到了用户指定的容器程序在容器文件系统的执行路径之后，初始化进程又打开了我们之前多次提到的`exec.fifo`这个管道，并且往里面写了一个字节，之后才执行Exec系统调用，切换到用户程序。既然`exec.fifo`是一个管道，那么我们在这一端写入之后，就必须有消费者在另外一端进行读取，否则写进程就会一直处于阻塞状态。
+不过在找到了用户指定的容器程序在容器文件系统的执行路径之后，初始化进程又打开了我们之前多次提到的`exec.fifo`这个管道，并且往里面写入了一个字节，之后才执行`Exec`系统调用，切换到用户程序。既然`exec.fifo`是一个管道，那么我们在这一端写入之后，就必须有消费者在另外一端进行读取，否则写进程就会一直处于阻塞状态。
 
 事实上，此处对`exec.fifo`管道的写阻塞正是`runc create`和`runc start`执行流的分界点。容器的创建工作，在容器初始化进程往`exec.fifo`管道进行写操作的那一刻，就全部结束了。
 
@@ -592,9 +592,9 @@ func (c *linuxContainer) exec() error {
 }
 ```
 
-`Exec`方法仅仅只是对`exec`的简单封装。而`exec`函数的工作很简单，找到`exec.fifo`管道的路径，打开它，并调用`readFromExecFifo`从管道中将容器初始化进程从另一端写入的字节读出。一旦管道中的数据被读出，容器内的初始化进程将不再被阻塞，紧接着将完成`Exec`系统调用，容器进程将切换为用户指定的程序。到此为止，一个容器真正启动成功。
+`Exec`方法仅仅只是对`exec`的简单封装。而`exec`方法的工作很简单，找到`exec.fifo`管道的路径，打开它，并调用`readFromExecFifo`从管道中将容器初始化进程从另一端写入的字节读出。一旦管道中的数据被读出，容器内的初始化进程将不再被阻塞，紧接着将完成`Exec`系统调用，容器初始化进程将被切换为用户指定的程序。到此为止，一个容器真正启动成功。
 
-可是这一路分析下来，似乎并没有对容器的namespace进行配置的操作？事实上，子进程`runc init`的执行流在进入Go语言的运行时之前，会被包`/runc/libcontainer/nsenter`劫持，先去执行一段C代码。这段C代码同样会从init管道中读取容器的配置，主要是namespace的路径，clone flag等等。之后会根据这些配置，调用`setns`系统调用，将容器进程加入到合适的namespace中。之后再进入Go的运行时，完成上文所述的各种初始化操作。
+可是这一路分析下来，似乎并没有对容器的namespace进行配置的操作？事实上，子进程`runc init`的执行流在进入Go语言的运行时之前，会被包`/runc/libcontainer/nsenter`劫持，先去执行一段C代码。这段C代码同样会从`init`管道中读取容器的配置，主要是namespace的路径，clone flag等等，并根据这些配置，调用`setns`系统调用，将容器进程加入到合适的namespace中。之后再进入Go的运行时，完成上文所述的各种初始化操作。
 
 
 
@@ -605,8 +605,8 @@ func (c *linuxContainer) exec() error {
 1. `runc create`命令加载文件`config.json`中容器的配置并转化为与`libcontainer`兼容的模式
 2. `libcontainer`根据配置创建`Container`以及`ParentProcess`对象
 3. `Parentproces`创建`runc init`子进程，中间会被`/runc/libcontainer/nsenter`劫持，使`runc init`子进程位于容器配置指定的各个namespace内
-4. `Parent Process`用init管道将容器配置信息传输给`runc init`进程，`runc init`再据此进行容器的初始化操作。初始化完成之后，再向另一个管道`exec.fifo`进行写操作，进入阻塞状态
-5. 执行`runc start`命令，从管道`exec.fifo`中读取`4`中写入的字节。`runc init`进程不再阻塞，执行Exec系统调用，切换至用户指定的容器进程
+4. `ParentProcess`用`init`管道将容器配置信息传输给`runc init`进程，`runc init`再据此进行容器的初始化操作。初始化完成之后，再向另一个管道`exec.fifo`进行写操作，进入阻塞状态
+5. 执行`runc start`命令，从管道`exec.fifo`中读取上一个步骤写入的字节。`runc init`进程不再阻塞，执行`Exec`系统调用，切换至用户指定的容器进程，容器真正创建并启动完成
 
 
 
