@@ -91,22 +91,22 @@ Kubernetes是容器编排领域的事实标准，不过由于其声明式API的�
 
 ```go
 // istio/pilot/pkg/serviceregistry/kube/controller.go
-	informer.AddEventHandler(
-		cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				c.queue.Push(Task{handler: handler.Apply, obj: obj, event: model.EventAdd})
-			},
-			UpdateFunc: func(old, cur interface{}) {
-				if !reflect.DeepEqual(old, cur) {
-					c.queue.Push(Task{handler: handler.Apply, obj: cur, event: model.EventUpdate})
-				} else {
-					....
-				}
-			},
-			DeleteFunc: func(obj interface{}) {
-				c.queue.Push(Task{handler: handler.Apply, obj: obj, event: model.EventDelete})
-			},
-		})
+informer.AddEventHandler(
+	cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			c.queue.Push(Task{handler: handler.Apply, obj: obj, event: model.EventAdd})
+		},
+		UpdateFunc: func(old, cur interface{}) {
+			if !reflect.DeepEqual(old, cur) {
+				c.queue.Push(Task{handler: handler.Apply, obj: cur, event: model.EventUpdate})
+			} else {
+				....
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			c.queue.Push(Task{handler: handler.Apply, obj: obj, event: model.EventDelete})
+		},
+	})
 ```
 
 可以看到，一旦资源发生变动，事件类型、资源实例以及资源的处理函数就会被加入一个队列中，再由队列进行异步处理，处理过程即为依次调用通过上文中的`Controller`接口注册的处理函数。
@@ -241,5 +241,144 @@ type ConfigStoreCache interface {
 
 ### 5. xDS协议
 
+Istio通过服务发现获取了整个网格的服务视图，用户则通过Istio提供的一系列资源对象定义了服务间的访问规则，然而网格中真正进行流量转发的是底层的Proxy。因此，Pilot还需要将服务及其流量管理规则下发至Proxy，而下发过程中，两者之间交互的协议即为xDS协议。
 
+Istio底层使用的Proxy官方默认为Envoy，Envoy作为CNCF第三个“毕业”的项目，其成熟度和稳定性都已经经历了大量实践的检验。事实上，xDS协议正是由Envoy社区提出的，在Envoy刚开源的时候，就有大量关于能否让Envoy支持Consul，Kubernetes，Marathon等服务发现平台的请求在社区提出。但是社区最后发现，与其直接对各种服务发现平台提供支持，还不如提供一套简单中立的API，明确划分控制平面和数据平面的界限，再由用户利用这套API将Envoy集成到其具体的工作流中，满足其特定需求，这一想法最终演化出了xDS协议。
+
+可以发现对于Envoy来说，Istio只是基于其实现的控制平面中的一种，Istio和Envoy事实上拥有的是两套资源对象，Pilot通过xDS将配置下发之前还需要进行一次配置的转换。因此，首先对Envoy主要的资源对象进行简要介绍：
+
+* **Cluster**: 一个Cluster可以简单地与上文中的一个Service或者一个Service的Subset相对应，其配置的主要字段如下所示：
+
+```
+{
+	"name": "...",
+	"type": "...",
+	"eds_cluster_config": "{...}",
+	"hosts": [],
+	...
+}
+```
+
+Cluster的类型由`type`字段指定，共分为如下五种：
+
+1. Static: 直接在`hosts`字段指定Service实例的IP和端口
+2. Strict DNS: `hosts`字段指定后端的Service Name和端口，通过DNS获取后端Service实例的IP地址，若返回多个IP地址，则Envoy会在之间进行负载均衡
+3. Logical DNS: 与`Strict DNS`类似，但仅使用DNS返回的第一个IP
+4. Original destination：直接使用HTTP header中指定的目标IP地址
+5. EDS: 通过上层的控制平面获取后端的Service实例的IP和端口，Istio+Envoy模式下最常见的Cluster类型
+
+* **ClusterLoadAssignment**: Cluster后端的具体实例集合，可以简单地与Kubernetes中的Endpoints相对应，其配置的主要字段如下：
+
+```
+{
+	"cluster_name": "...",
+	"endpoints": [],
+	...
+}
+```
+
+其中`cluster_name`指定了关联的Cluster，`endpoints`则包含了若干具体实例的IP地址和端口信息
+
+* **Listener**: 监听并截取发往某个IP地址和端口的流量并处理，在Istio+Envoy体系下，由于基本上所有流量都会通过Iptables转发进入Envoy，因此只有一个特殊的"Virtual Listener"用于统一接收流量，再由其根据流量的目的IP和端口转发至具体的Listener进行处理。其配置的主要字段如下：
+
+```
+{
+	"name": "...",
+	"address": "...",
+	"filter_chains": [],
+	...
+}
+```
+
+`address`字段指定了Listener监听的地址，而`filter_chains`字段则定义了一系列的filter用于对流量进行处理。当遍历完各个filter之后，对于`envoy.tcp_proxy`类型的filter会直接指定需要导向的Cluster，但是对于`envoy.http_connection_manager`类型的filter则会利用`rds`字段，指向特定的路由表，根据路由表决定后端的Cluster
+
+* **RouteConfiguration**: 其配置的主要字段如下：
+
+```
+// RouteConfiguration
+{
+	"name": "...",
+	"virtual_hosts": [],
+	....
+}
+// VirtualHost
+{
+	"name": "...",
+	"domains": [],
+	"routes": [],
+	...
+}
+// Route
+{
+	"match": "{...}",
+	"route": "{...}",
+	...
+}
+```
+`RouteConfiguration`结构即表示上文所述的路由表，因为一个路由表可能包含通往多个Service的路由，因此通过`VirtualHost`对一个Service进行抽象。而`VirtualHost`中的`domains`字段用于和接收到的HTTP请求的host header进行匹配，一旦匹配成功，则该`VirtualHost`被选中。之后再进入`VirtualHost`的`routes`字段进行二级匹配，例如`match`字段指定匹配的前缀为`/`，则执行下一个字段`route`，一般其中指定了后端的Cluster。
+
+![listener](./pic/pilot/listener.jpeg)
+
+如上图所示，当需要访问`details:9080`时，Envoy会通过Iptables截取流量并转入相应的Listener进行处理。Listener遍历各个Filter，之后通过Route或者直接指定目标Cluster。多数Cluster通过与控制平面，例如Istio进行交互获取LoadAssignment，并从中选择目标Service实例的IP和端口，对于STATIC等类型的Cluster，IP和端口则不需要通过控制平面，可以直接获取，由此与具体的实例建立连接。
+
+上文简述了Envoy中的Listener等核心资源对象及其作用，早先Envoy将xDS协议划分为`CDS`，`EDS`，`LDS`，`RDS`四个部分，分别用于获取`Cluster`，`Cluster LoadAssignment`，`Listener`，`RouteConfiguration`四类资源对象。但是，经过仔细研究可以发现，这些资源对象之间是存在一定的依赖关系的。例如，`EDS`依赖于`CDS`，`RDS`依赖于`LDS`。若各资源对象分别建立连接从多个控制平面获取相应的对象，则资源对象间的时序关系将难以控制。因此，在Istio中，上述四类资源对象都通过单个的gRPC流从单个的控制平面实例中获取，这种聚合获取资源的方式称为ADS（Aggregated Discovery Services）。
+
+回归到源码中，Pilot中与Envoy交互部分的代码被封装在目录`istio/pilot/pkg/proxy`，具体关于xDS协议的实现，则位于`istio/pilot/pkg/proxy/envoy/v2`中。当前，Pilot处理xDS协议的核心框架则位于`StreamAggregatedResources`方法，如下所示：
+
+```go
+// istio/pilot/pkg/proxy/envoy/v2/ads.go
+func (s *DiscoveryServer) StreamAggregatedResources(stream ads.AggregatedDiscoveryService_StreamAggregatedResourcesServer) error {
+	// 初始化连接
+	con := newXdsConnection(peerAddr, stream)
+	...
+	// 接收来自Proxy的事件
+	reqChannel := make(chan *xdsapi.DiscoveryRequest, 1)
+	go receiveThread(con, reqChannel, &receiveError)
+
+	for {
+		select {
+		case discReq, ok := <-reqChannel:
+			...
+			switch discReq.TypeUrl {
+			case ClusterType:
+				...
+				err := s.pushCds(con, s.globalPushContext(), versionInfo())
+			case ListenerType:
+				...
+			case RouteType:
+				...
+			case EndpointType:
+				...
+			}
+			...
+		case pushEv := <-con.pushChannel:
+			...
+			err := s.pushConnection(con, pushEv)
+			...
+		}
+	}
+}
+```
+
+上述方法为我们清晰地勾勒出了xDS协议的架构。首先Pilot接收并初始化来自Envoy的连接，之后则进入循环，等待相应的事件并进行处理，事件源主要包含如下两部分：
+
+* **Envoy**：当Envoy初始化的时候会主动与Pilot建立连接并发送请求获取配置，一般发送请求的顺序为：CDS -> EDS -> LDS -> RDS，Pilot则根据请求的类型下方相应的配置
+* **变更**：如前文所述，服务以及用户对其访问规则的配置并不是一成不变的，而底层Envoy所需的xDS API事实上是由发现的服务及对其的配置推导而来。因此，每当服务发现获取到的服务或者用户对Istio资源对象的配置发生变更，都会导致Envoy配置的重新计算并下发，select语句的第二个case正是用于处理此种情况。
+
+
+### 6. 总结
+
+本文结合源码对Istio的核心组件Pilot进行了深入的介绍，经过上文的分析不难发现，Pilot在整个体系中的角色其实是`适配器+API转换层+推送器`：
+
+* **适配器**：虽然前文对于Service以及Istio资源对象进行了分别的描述，但事实上两者是一致的，都只是一种资源，Pilot对它进行了标准的定义并用它去适配Kubernetes等各个平台
+* **API转换层**：Pilot从上层获取了Service以及VirtualServices等Istio资源对象，但是它们与xDS定义的Listener等Envoy要求的资源对象并不存在直接对应关系，因此需要进行一层API的转换
+* **推送器**：Service以及VirtualService等Istio资源对象并非一成不变的，而Listener等xDS API对象则由前者直接推导得到，因此一旦前者发生变更，后者必须重新推导并推送
+
+### 参考文献
+
+* [Istio源码及我的注释](https://github.com/YaoZengzeng/istio/tree/comments)
+* [xDS REST and gRPC protocol](https://github.com/envoyproxy/data-plane-api/blob/master/XDS_PROTOCOL.md)
+* [The universal data plane API](https://blog.envoyproxy.io/the-universal-data-plane-api-d15cec7a)
+* [Istio流量管理实现机制深入解析](https://zhaohuabing.com/post/2018-09-25-istio-traffic-management-impl-intro/)
+* [Istio的数据平面Envoy Proxy配置详解](http://www.servicemesher.com/blog/envoy-proxy-config-deep-dive/)
 
