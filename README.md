@@ -19,3 +19,7 @@ Some Analysis Articles Of Kubernetes Ecosystem Writing By My Own Research
 ## Service Mesh
 
 * [深入理解Istio核心组件之Pilot](深入理解Istio核心组件之Pilot.md)
+
+## Prometheus
+
+* [Prometheus在Kubernetes下的服务发现机制](Prometheus在Kubernetes下的服务发现机制.md)
