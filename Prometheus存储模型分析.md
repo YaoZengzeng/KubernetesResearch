@@ -146,3 +146,81 @@ Prometheus内存中的存储结构大致如上，Gorilla的压缩算法提高了
 
 ### WAL
 
+Prometheus启动时，往往需要在参数中指定tsdb的存储目录，该目录包含WAL以及用于持久化的Block，结构如下：
+
+```bash
+# ls
+01DJQ428PCD7Z06M6GKHES65P2  01DJQAXZY8MPVWMD2M4YWQFD9T  01DJQAY7F9WT8EHT0M8540F0AJ  lock  wal
+#
+```
+
+形如`01DJQ428PCD7Z06M6GKHES65P2`都是Block目录，用于存放持久化之后的时序数据，这部分内容后文会有详细的叙述。本节我们重点关注`wal`目录，它的内部结构如下所示：
+
+```bash
+wal # ls -lht
+total 596M
+-rw-r--r-- 1 65534 65534  86M Aug 20 19:32 00000012
+drwxr-xr-x 2 65534 65534 4.0K Aug 20 19:00 checkpoint.000006
+-rw-r--r-- 1 65534 65534 128M Aug 20 19:00 00000011
+-rw-r--r-- 1 65534 65534 128M Aug 20 18:37 00000010
+-rw-r--r-- 1 65534 65534 128M Aug 20 17:47 00000009
+-rw-r--r-- 1 65534 65534 128M Aug 20 17:00 00000008
+-rw-r--r-- 1 65534 65534 128M Aug 20 16:38 00000007
+wal #
+```
+
+`wal`目录中包含了多个连续编号的且大小为128M的文件，Prometheus称这样的文件为`Segment`，其中存放的就是内存中series以及sample的备份数据。另外还包含一个以`checkpoint`为前缀的子目录，由于内存中的时序数据经常会做持久化处理，`wal`中的数据也将出现冗余。因此在对内存数据进行持久化之后，Prometheus会对部分编号靠后的Segment进行清理。但是我们并没有办法做到恰好将已经持久化的数据从Segment删除，也就是说被删除的Segment文件中的部分内容依然可能是有用的。所以在清理Segment时，我们会将肯定无效的数据清理掉，剩下的数据就存放在`checkpoint`中。而在Prometheus重启时，应该首先加载`checkpoint`中的内容，再按序加载各个`Segment`的内容。
+
+那么series和sample在Segment是如何组织的呢？在将时序数据备份到`wal`的过程中，由于涉及到磁盘文件`Segment`的写入，批量操作显然是最经济的。对于批量写入，Prometheus提供了一个名为`Appender`的接口如下：
+
+```golang
+type Appender interface {
+	Add(l labels.Labels, t int64, v float64) (uint64, error)
+
+	AddFast(ref uint64, t int64, v float64) error
+
+	Commit() error
+
+	Rollback() error
+}
+```
+
+每当需要写入数据时，就要创建一个`Appender`，`Appender`是一个临时结构，仅供一次批量操作使用。一个`Appender`类似于其他数据库中事务的概念，通过`Add()`或者`AddFast()`添加的时序数据会首先在`Appender`中进行缓存，只有在最后调用`Commit()`之后，这批数据才正式提交给Prometheus，同时写入`wal`。如果最后调用的`Rollback()`，则这批数据的samples全部会被丢弃，但是通过`Add()`方法新增的`series`结构则依然会被保留。
+
+`series`和`sample`在`Appender`中是分开存储的，它们在`Appender`中的结构如下：
+
+```golang
+// headAppender是Appender的一种实现
+type headAppender struct {
+	...
+	series		[]RefSeries
+	samples	[]RefSample
+}
+
+type RefSeries struct {
+	Ref		uint64
+	Labels	labels.Labels
+}
+
+type RefSample struct {
+	Ref		uint64
+	T		int64
+	V		float64
+	series	*memSeries
+}
+```
+
+当调用`Appender`的`Commit()`方法提交这些时序数据时，`series`和`samples`这两个切片会分别编码，形成两条`Record`，如下所示：
+
+```
+|RecordType|RecordContent|
+
+RecordType可以取值：RecordSample或者RecordSeries，表示这条Record的类型
+
+RecordContent则根据RecordType可以series或者samples编码的内容
+```
+
+最后，`series`和`samples`以`Record`的形式被批量写入`Segment`文件中，默认当`Segment`超过128M时，会创建新的`Segment`文件。若Prometheus因为各种原因崩溃了，`wal`里的各个`Segment`以及`checkpoint`里的内容就是在崩溃时刻Prometheus内存的映像。Prometheus在重启时只要加载`wal`中的内容就能完全"恢复现场"。
+
+### Block
+
