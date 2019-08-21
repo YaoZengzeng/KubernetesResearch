@@ -29,3 +29,5 @@ Some Analysis Articles Of Kubernetes Ecosystem Writing By My Own Research
 
 * [如何利用Prometheus监控你的应用](如何利用Prometheus监控你的应用.md)
 
+* [Prometheus存储模型分析](Prometheus存储模型分析.md)
+
