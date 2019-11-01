@@ -97,8 +97,112 @@ spec:
         info: High Request Load
 ```
 
-上面展示的就是近乎最简的`Prometheus`和`PrometheusRule`资源对象。当上述yaml文件被提交至Kubernetes APIServer之后，Prometheus Operator会马上同步到并根据`Prometheus`的配置生成一个StatefulSet用于运行Prometheus Server实例，同时将`Prometheus`中的配置写入Server的配置文件中。对于`PrometheusRule`，我们可以发现它的内容与上面的告警规则文件是基本一致的。Prometheus Operator会依据`PrometheusRule`的内容生成相应的ConfigMap并将其以Volume的形式挂载到Prometheus Server所在Pod的对应目录中。
+上面展示的就是近乎最简的`Prometheus`和`PrometheusRule`资源对象。当上述yaml文件被提交至Kubernetes APIServer之后，Prometheus Operator会马上同步到并根据`Prometheus`的配置生成一个StatefulSet用于运行Prometheus Server实例，同时将`Prometheus`中的配置写入Server的配置文件中。对于`PrometheusRule`，我们可以发现它的内容与上面的告警规则文件是基本一致的。Prometheus Operator会依据`PrometheusRule`的内容生成相应的ConfigMap并将其以Volume的形式挂载到Prometheus Server所在Pod的对应目录中。最终一个`PrometheusRule`资源对象对应一个挂载目录中的告警规则文件。
 
 那么Operator是如何将`Prometheus`和`PrometheusRule`关联在一起的呢？类似于Service通过Selector字段指定关联的Pod。`Prometheus`也通过ruleSelector字段指定了一组label，Operator会将任何包含这些label的`PrometheusRule`都整合到一个ConfigMap(若超出单个ConfigMap的限制，则生成多个)并挂载到`Prometheus`对应的StatefulSet的各个Pod实例中。因此，在Prometheus Operator的帮助下，对于Prometheus告警规则进行增删改查的难度已经退化到对Kubernetes资源对象的CRUD操作，整个过程中最为繁琐的部分已经完全被Operator自动化了。事实上，Prometheus Server的高级配置乃至AlertManager的部署都可以通过Prometheus Operator提供的CRD轻松实现，因为与本文关联不大，所以不再赘述了。
 
 最后，虽然Operator能保证对于`PrometheusRule`的增删改查能及时反映到相应的ConfigMap中，而Kubernetes本身则保证了ConfigMap的修改也最终能同步到相应Pod的挂载文件中，但是Prometheus Server并不会监听告警规则文件的变更。因此，我们需要以Sidecar的形式将[ConfigMap Reloader](https://github.com/jimmidyson/configmap-reload)部署在Prometheus Server所在的Pod内。由它来监听告警规则所在ConfigMap的变更，一旦监听到变化，它就会调用Prometheus Server提供的Reload接口，触发Prometheus对于配置的重新加载。
+
+### 4. 告警实例结构
+
+AlertManager本质上是一个HTTP Server用于接受并处理来自Client的告警实例。Client一般都为Prometheus Server，但是任何程序只要能构造出符合标准的告警实例，都能通过POST方法将它们提交至AlertManger进行处理。因此，在生产环境中，对于无法利用Prometheus时序数据生成的告警，例如对于Kubernetes中的Event，我们也可以通过适当的构造，将其发送至AlertManager进行统一处理。告警实例的结构如下：
+
+```json
+[
+  {
+    "labels": {
+      "alertname": "<requiredAlertName>",
+      "<labelname>": "<labelvalue>",
+      ...
+    },
+    "annotations": {
+      "<labelname>": "<labelvalue>",
+    },
+    "startsAt": "<rfc3339>",
+    "endsAt": "<rfc3339>",
+    "generatorURL": "<generator_url>"
+  },
+  ...
+]
+```
+
+labels和annotations字段在前文已经有所提及：labels用于唯一标识一个告警，AlertManger会对labels完全相同的告警实例进行压缩聚合操作。annotations是一些类似于告警详情等的附加信息。这里我们重点关注`startsAt`和`endsAt`这两个字段，这两个字段分别表示告警的起始时间和终止时间，不过两个字段都是可选的。当AlertManager收到告警实例之后，会分以下几类情况对这两个字段进行处理：
+
+1. 两者都存在：不做处理
+2. 两者都为指定：startsAt指定为当前时间，endsAt为当前时间加上告警持续时间，默认为5分钟
+3. 只指定startsAt：endsAt指定为当前时间加上默认的告警持续时间
+4. 只指定endsAt：将startsAt设置为endsAt
+
+AlertManager一般以当前时间和告警实例的endsAt字段进行比较用以判断告警的状态：
+
+1. 若当前时间位于endsAt之前，则表示告警仍然处于触发状态（firing）
+2. 若当前时间位于endsAt之后，则表示告警已经消除（resolved）
+
+另外，当Prometheus Server中配置的告警规则被持续满足时，默认会每隔一分钟发送一个告警实例。显然，这些实例除了startsAt和endsAt字段以外都完全相同（其实Prometheus Server会将所有实例的startsAt设置为告警第一次被触发的时间）。最终，这些实例都会以如下图所示的方式进行压缩去重：
+
+![alerts](./pic/alertmanager/alerts.jpg)
+
+三条最终labels相同的告警最终被压缩聚合为一条告警。当我们进行查询时，只会得到一条起始时间为t1，结束时间为t4的告警实例。
+
+### 5. AlertManager架构概述
+
+![alertmanager](./pic/alertmanager/alertmanager.jpg)
+
+AlertManager本质上来说是一个强大的告警分发过滤器。所有告警统一存放在Alert Provider中，Dispatcher则会对其中的告警进行订阅。每当AlertManager接受到新的告警实例就会先在Alert Provider进行存储，之后立刻转发到Dispatcher中。Dispatcher则定义了一系列的路由规则将告警发送到预定的接收者。而告警在真正发送到接收者之前，还需要经过一系列的处理，即图中的Notification Pipeline，例如对相关告警在时间和空间维度进行聚合，对用户指定的告警进行静默，检测当前告警是否被已经发送的告警抑制，甚至在高可用模式下检测该告警是否已由集群中的其他节点发送。而这一切的操作的最终目的，都为了让能让接收者准确接受到其最关心的告警信息，同时避免告警的冗余重复。
+
+
+### 6. Alert Provider
+
+所有进入AlertManager的告警实例都会首先存储在Alert Provider中。Alert Provider本质上是一个内存中的哈希表，用于存放所有的告警实例。因为labels唯一标识了一个告警，因此哈希表的key就是告警实例的label取哈希值，value则为告警实例的具体内容。若新接受到的告警实例在哈希表中已经存在且两者的[startsAt, endsAt]有重合，则会先将两者进行合并再刷新哈希表。同时，Alert Provider提供了订阅接口，每当接收到新的告警实例，它都会在刷新哈希表之后依次发送给各个订阅者。
+
+值得注意的是，Alert Provider是存在GC机制的。默认每隔30分钟就会对已经消除的告警（即endsAt早于当前时间）进行清除。显然，AlertManager从实现上来看并不支持告警的持久化存储。已经消除的告警会定时清除，由于存储在内存中，若程序重启则将丢失所有告警数据。但是如果研读过AlertManager的代码，对于Alert Provider的实现是做过良好的封装的。我们完全可以实现一套底层存储基于MySQL，ElasticSearch或者Kafka的Alert Provider，从而实现告警信息的持久化（虽然AlertManager并不提供显式的插件机制，只能通过hack代码实现）。
+
+### 7. 告警的路由与分组
+
+将所有告警统一发送给所有人显然是不合适的。因此AlertManager允许我们按照如下规则定义一系列的接收者并制定路由策略将告警实例分发到对应的目标接收者：
+
+```yaml
+global:
+  // 所有告警统一从此处进入路由表
+  route:
+    // 根路由
+    receiver: ops-mails
+    group_by: ['cluster', 'alertname']
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 5h
+    routes:
+    // 子路由1
+    - match_re:
+        service: ^(foo1|foo2|baz)$
+      receiver: team-X-webhook
+    // 子路由2
+    - match:
+        service: database
+      receiver: team-DB-pager
+  
+  // 接收者
+  receivers:
+  - name: 'ops-mails'
+    email_configs:
+    - to: 'ops1@example.org, ops2@example.com'
+  - name: 'team-X-webhook'
+    webhook_configs:
+    - url: 'http://127.0.0.1:8080/webhooks'
+  - name: 'team-DB-pager'
+    pagerduty_configs:
+    - routing_key: <team-DB-key>    
+```
+上述AlertManager的配置文件中定义了一张路由表以及三个接收者。AlertManager已经内置了Email，Slack，微信等多种通知方式，如果用户想要将告警发送给内置类型以外的其他信息平台，可以将这些告警通过webhook接口统一发送到webhook server，再由其转发实现。AlertManager的路由表整体上是一个树状结构，所有告警实例进入路由表之后会进行深度优先遍历，直到最终无法匹配并发送至父节点的Receiver。
+
+需要注意的是路由表的根节点默认匹配所有告警实例，示例中根节点的receiver是ops-mails，表示告警默认都发送给运维团队。路由表的匹配规则是根据labels的匹配实现的。例如，对于子路由1，若告警包含key为service的label，且label的value为foo1, foo2或者baz，则匹配成功，告警将发送至team X。若告警包含service=database的label，则将其发送至数据库团队。
+
+有的时候，作为告警的接收者，我们希望相关的告警能统一通过一封邮件进行发送，一方面能减少同类告警的重复，另一方面也有利于我们对告警进行归档。AlertManager通过Group机制对这一点做了很好的支持。每个路由节点都能配置以下四个字段对属于本节点的告警进行分组（若当前节点未显式声明，则继承父节点的配置）：
+
+1. `group_by`：指定一系列的label键值作为分组的依据，示例中利用cluster和alertname作为分组依据，则同一集群中，所有名称相同的告警都将统一通知。若不想对任何告警进行分组，则可以将该字段指定为'...'
+2. `group_wait`：当相应的Group从创建到第一次发送通知的等待时间，默认为30s，该字段的目的为进行适当的等待从而在一次通知中发送尽量多的告警。在每次通知之后会将已经消除的告警从Group中移除。
+3. `group_interval`：Group在第一次通知之后会周期性地尝试发送Group中告警信息，因为Group中可能有新的告警实例加入，本字段为该周期的时间间隔
+4. `repeat_interval`：在Group没有发生更新的情况下重新发送通知的时间间隔
+
+综上，AlertManager的Dispatcher会将新订阅得到的告警实例根据label进行路由并加入或者创建一个新的Group。而新建的Group经过指定时间间隔会将组中的告警实例统一发送并周期性地检测组内是否有新的告警加入（或者有告警消除，但需要显式配置），若是则再次发送通知。另外每隔repeat_interval，即使Group未发生变更也将再次发送通知。
+
