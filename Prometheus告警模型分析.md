@@ -206,3 +206,70 @@ global:
 
 综上，AlertManager的Dispatcher会将新订阅得到的告警实例根据label进行路由并加入或者创建一个新的Group。而新建的Group经过指定时间间隔会将组中的告警实例统一发送并周期性地检测组内是否有新的告警加入（或者有告警消除，但需要显式配置），若是则再次发送通知。另外每隔repeat_interval，即使Group未发生变更也将再次发送通知。
 
+### 8. Alert Notification Pipeline
+
+通常来说，一个Group中会包含多条告警实例，但是并不是其中的所有告警都是用户想要看到的。而且已知Group都会周期性地尝试发送其包含的告警，如果没有新的告警实例加入，在一定时间内，显然没有再重复发送告警通知的必要，另外如果对AlertManager进行高可用部署的话，多个AlertManager之间也需要做好协同，避免重复告警。如上文中AlertManager的整体架构图所示，当Group尝试发送告警通知时，总是先要经过一条Notification Pipeline的过滤，最终满足条件的告警实例才能通过邮件的方式发出。一般过滤分为抑制（Inhibit），静默（silence）以及去重（dedup）三个步骤。下面我们将逐个进行分析。
+
+#### 8.1 告警抑制
+
+所谓的告警抑制其实是指，当某些告警已经触发时，则不再发送其他受它抑制的告警。一个典型的使用场景为：如果产生了一条集群不可用的告警，那么任何与该集群相关的告警都应当不再通知给用户，因为这些告警都是由集群不可用引起的，发送它们只会增加用户找到问题根因的难度。告警的抑制规则会配置在AlertManager全局的配置文件中，如下所示：
+
+```yaml
+inhibit_rules:
+- source_match:
+    alertname: ClusterUnavailable
+    severity: critical
+  target_match:
+    severity: critical
+  equal:
+    - cluster
+```
+
+该配置的含义为，若出现了包含label为{alertname="ClusterUnavailable", severity="critical"}的告警实例A，AlertManager就会对其进行记录。当后续出现告警实例包含label为{severity="critical"}且"cluster"这个label对应的value和A的“cluster”对应的value相同，则该告警实例被抑制，不再发送。
+
+当Group每次尝试发送告警实例时，AlertManager都会先用抑制规则筛选掉满足条件的实例，剩余的实例才能进入Notification Pipeline的下一个步骤，即告警静默。
+
+#### 8.2 告警静默
+
+告警静默指的是用户可以选择在一段时间内不接收某些告警。与Inhibit rule不同的是，静默规则可以由用户动态配置，AlertManager甚至提供了如下所示的图形UI：
+
+![silence](./pic/alertmanager/silence.png)
+
+与告警自身的定义方式类似，静默规则也是在一个时间段内起作用，需用明确指定开始时间与结束时间。而静默规则同样通过指定一组label来匹配作用的告警实例。例如在上图的例子中，任何包含label为{alertname="clusterUnavailable", severity="critical"}的告警实例都将不再出现在通知中。
+
+显然，静默规则又将滤去一部分告警实例，如果此时Group中仍有剩余的实例，则将进入Notification的下一步骤，告警去重。
+
+#### 8.3 告警去重
+
+每当一个Group第一次成功发送告警通知之后，AlertManager就会为其创建一个Notification Log（简称nflog），其结构如下：
+
+```golang
+e := &pb.MeshEntry{
+	Entry: &pb.Entry{
+		Receiver;	r,
+		GroupKey:	[]byte(gkey),
+		Timestamp: now,
+		FiringAlerts: firingAlerts,
+		ResolvedAlerts: resolvedAlerts,
+	},
+	ExpiredAt: now.Add(l.retention)
+}
+```
+
+可以看到，每个Notification Log中包含：
+
+1. 该Group的Key（即该Group用于筛选Alerts的labels的哈希值）
+2. 该Group对应的Receiver
+3. 该Notification Log创建的时间
+4. 该Group中正在触发的各个告警实例的哈希值
+5. 该Group中各个已经消除的告警实例的哈希值
+6. 该Notification Log过期的时间，默认为120小时
+
+当Group再次周期性地尝试推送通知并经过抑制和静默的两层筛选之后，若仍然有告警实例存在，则会进入告警去重阶段。首先找到该Group对应的Notification Log并只在以下任一条件满足的时候发送通知：
+
+1. Group剩余的告警实例中，处于触发状态的告警实例不是Notification Log中的FiringAlerts的子集，即有新的告警实例被触发
+2. Notification Log中FiringAlerts的数目不为零，但是当前Group中处于触发状态的告警实例数为0，即Group中的告警全部被消除了
+3. Group中已消除的告警不是Notification Log中ResolvedAlerts的子集，说明有新的告警被消除，且通知配置中设置对于告警消除进行通知。例如，Email默认不在个别告警实例消除时通知而Webhook则默认会进行通知。
+
+综上，通过Notification Pipeline通过对告警的抑制，静默以及去重确保了用户能够专注于真正重要的告警而不会被过多无关的或者重复的告警信息所困扰。
+
