@@ -273,3 +273,37 @@ e := &pb.MeshEntry{
 
 综上，通过Notification Pipeline通过对告警的抑制，静默以及去重确保了用户能够专注于真正重要的告警而不会被过多无关的或者重复的告警信息所困扰。
 
+### 9. 高可用
+
+当真正部署到生产环境中，如果只部署单个实例的AlertManager显然是无法满足可用性的。因此AlertManager原生支持多实例的部署方式并用Gossip协议来同步实例间的状态。因为AlertManager并非是无状态的，它有如下两个关键信息需要同步：
+
+1. 告警静默规则：当存在多个AlertManager实例时，用户依然只会向其中一个实例发起请求，对静默规则进行增删。但是对于静默规则的应用显然应当是全局的，因此各个实例应当广播各自的静默规则，直到全局一致。
+2. Notification Log：既然要保证高可用，即确保告警实例不丢失，而AlertManager实例又是将告警保存在各自的内存中的，因此Prometheus显然不应该在多个AlertManager实例之间做负载均衡而是应该将告警发往所有的AlertManager实例。但是对于同一个Alert Group的通知则只能由一个AlertManager发送，因此我们也应该把Notification Log在全集群范围内进行同步。
+
+当以集群模式运行AlertManager时，AlertManager的命令行参数配置如下：
+
+```bash
+--cluster.listen-address=0.0.0.0:9094
+--cluster.peer=192.168.1.1:9094
+--cluster.peer=192.168.1.2:9094
+```
+
+当AlertManager启动时，它会首先从`cluster.peer`参数指定的地址和端口进行Push/Pull：即首先将本节点的状态信息（全部的Silence以及Notification Log）发送到对端，再从对端拉取状态信息并与本节点的状态信息合并：例如，对于从对端拉取到的静默规则，如果有本节点不存在的规则则直接添加，若是规则在本节点已存在但是更新时间更晚，则用对端规则覆盖已有的规则。对于Notification Log的做法类似。最终，集群中的所有AlertManager都会有同样的静默规则以及Notification Log。
+
+如果此时用户在某个AlertManager请求增加新的静默规则呢？根据Gossip协议，该实例应该从集群中选取几个实例，将新增的静默规则发送给它们。而当这些实例收到广播信息时，一方面它会合并这一新的静默规则同时再对其进行广播。最后，整个集群都会接收到这一新添加的静默规则，实现了最终一致性。
+
+不过，Notification Log的同步并没有静默规则这么容易。我们可以假设如下场景：由于高可用的要求，Prometheus会向每个AlertManager发送告警实例。如果该告警实例不属于任何之前已有的Alert Group，则会新建一个Group并最终创建一个相应的Notification Log。而Notification Log是在通知完成之后创建的，所以在这种情况下，针对同一个告警发送了多次通知。
+
+为了避免这种情况的发生，社区给出的解决方案是错开各个AlertManager发送通知的时间。如上文的整体架构图所示，Notification Pipeline在进行去重之前其实还有一个Wait阶段。该阶段会将对于告警的通知处理暂停一段时间，不同的AlertManager实例等待的时间会因为该实例在整个集群中的位置有所不同。根据实例名进行排序，排名每靠后一位，默认多等待15秒。
+
+假设集群中有两个AlertManager实例，排名靠前的实例为A0，排名靠后的实例为A1，此时对于上述问题的处理如下：
+
+1. 假设两个AlertManager同时收到告警实例并同时到达Notification Pipeline的Wait阶段。在该阶段A0无需等待而A1需要等待15秒。
+2. A0直接发送通知，生成相应的Notification Log并广播
+3. A1等待15秒之后进入去重阶段，但是由于已经同步到A0广播的Notification Log，通知不再发送
+
+可以看到，Gossip协议事实上是一个弱一致性的协议，上述的机制能在绝大多数情况下保证AlertManager集群的高可用并且避免实例间同步的不及时对用户造成的困扰。但是仍然有待在严苛生产环境下的进一步验证，所幸的是，告警数据的强一致性并不是那么敏感。
+
+### 10. 总结
+
+本文对基于Prometheus的告警系统进行了较为详尽的分析：包括从告警规则在Prometheus Server的配置，Prometheus Server对告警规则的评估并触发告警实例发送至AlertManager，AlertManager的整体架构以及AlertManager对于告警实例的处理。可以看到，虽然执行链路基本完备，但是与Prometheus的监控模型已经成为事实标准相比，整个Prometheus告警模型的通用性和实用性仍然是存疑的，以笔者经验来看，如果要真正应用到生产环境中还需要做大量的适配与增强。
