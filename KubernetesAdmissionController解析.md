@@ -94,7 +94,9 @@ type AdmissionResponse struct {
 
 `Allowed`字段表示校验是否通过，`Result`字段在校验不通过时表明理由。Patch相关的字段仅在`Mutating`阶段使用，用于表示对资源对象的修改，此处最经典的案例莫过于Istio利用`MutatingWebhookConfiguration`自动注入Envoy作为应用的Proxy Sidecar。
 
-上述即为Admission Controller实现原理的全部内容，理解起来并不是十分困难，简而言之，APIServer内置了一堆准入控制插件能够对资源对象的增删改查进行控制甚至修改，从而保证了集群的安全可用以及对于资源对象配置统一灵活的管理，而基于Webhook的远程插件又进一步增加了这种灵活性。至于自定义插件本质上就是一个Webhook Server，分别针对`Mutating`和`Validating`实现相应的处理函数，为了更直观地理解，可以参考[Prometheus Operator](https://github.com/coreos/prometheus-operator/blob/master/pkg/admission/admission.go)中的实现。
+上述即为Admission Controller实现原理的全部内容，理解起来并不是十分困难，简而言之，APIServer内置了一堆准入控制插件能够对资源对象的增删改查进行控制甚至修改，从而保证了集群的安全可用以及对于资源对象配置统一灵活的管理，而基于Webhook的远程插件又进一步增加了这种灵活性。至于自定义插件本质上就是一个Webhook Server，分别针对`Mutating`和`Validating`实现相应的处理函数，为了更直观地理解，可以参考[Prometheus Operator](https://github.com/coreos/prometheus-operator/blob/master/pkg/admission/admission.go)中的实现。整个流程的示意图如下：
+
+![procedure](./pic/admissioncontroller/procedure.png)
 
 但是真正要在生产环境中应用Admission Controller这一特性，尤其是为CRD自定义插件，作为在APIServer之外独立运行的程序，APIServer与之交互伴随而来的安全问题是不得不考虑的。
 
@@ -106,7 +108,11 @@ Kubernetes构建了一套复杂的机制保证集群的安全，特别是与APIS
 
 1. 利用helm中的PrestartHook，构建前置Job（在annotation中指定`helm.sh/hook: pre-install,pre-upgrade`即可）用于构建自签名证书。此处需要使用一个名为[kube-webhook-certgen](https://github.com/jet/kube-webhook-certgen)的开源组件。该组件主要包含两个子命令，其中子命令`create`生成对应的ca以及cert+key并保存至指定的Secret中，具体配置参见[Prometheus Operator中的相关设置](https://github.com/helm/charts/blob/master/stable/prometheus-operator/templates/prometheus-operator/admission-webhooks/job-patch/job-createSecret.yaml#L33)。
 2. 真正执行插件部署，包括插件对应的Deployment，Service以及`MutatingWebhookConfiguration`或者`ValidatingWebhookConfiguration`。需要注意的是要将步骤1中生成的Secret中包含的cert和key挂载到插件对应的Pod中，使其能够构建基于HTTPS的Webhook Server供Kubernetes APIServer访问。当然，如果有的插件，类似于Prometheus Operator，本身并不支持HTTPS，则需要以Sidecar的形式部署一个[Proxy](https://github.com/square/ghostunnel)用作TLS Termination。由该Proxy挂载Secret中的cert和key并与APIServer直接交互，再由它将流量转发至Prometheus Operator真正完成准入控制，具体配置参见[Prometheus Operator中的相关设置](https://github.com/helm/charts/blob/master/stable/prometheus-operator/templates/prometheus-operator/deployment.yaml#L72)。
-3. 利用helm中的PoststartHook，构建后置Job。该Job同样利用了`kube-webhook-certgen`，与步骤1不同的是，这次使用的是子命令`patch`用于将指定Secret中的ca加载到`MutatingWebhookConfiguration`或者`ValidatingWebhookConfiguration`中。APIServer监听到配置变更之后就会重新加载`MutatingWebhookConfiguration`/`ValidatingWebhookConfiguration`，后续有符合规则的请求就能够通过HTTPS转发到对应的插件进行处理。
+3. 利用helm中的PoststartHook，构建后置Job。该Job同样利用了`kube-webhook-certgen`，与步骤1不同的是，这次使用的是子命令`patch`用于将指定Secret中的ca加载到`MutatingWebhookConfiguration`或者`ValidatingWebhookConfiguration`中。APIServer监听到配置变更之后就会重新加载`MutatingWebhookConfiguration`/`ValidatingWebhookConfiguration`，后续有符合规则的请求就能够通过HTTPS转发到对应的插件进行处理。该Job的具体配置参见[Prometheus Operator中的相关设置](https://github.com/helm/charts/blob/master/stable/prometheus-operator/templates/prometheus-operator/admission-webhooks/job-patch/job-patchWebhook.yaml#L32)
+
+上述步骤的示意图如下：
+
+![secure](./pic/admissioncontroller/secure.png)
 
 ### 总结
 
