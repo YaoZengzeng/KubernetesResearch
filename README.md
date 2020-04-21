@@ -7,6 +7,8 @@ Some Analysis Articles Of Kubernetes Ecosystem Writing By My Own Research
 
 * [Kubernetes Controller执行框架解析](KubernetesController执行框架解析.md)
 
+* [Kubernetes Admission Controller解析](KubernetesAdmissionController解析.md)
+
 ## Kubernetes Container Runtime
 
 * [深入理解Docker容器引擎runC执行框架](深入理解Docker容器引擎runC执行框架.md)
