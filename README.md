@@ -21,6 +21,10 @@ Some Analysis Articles Of Kubernetes Ecosystem Writing By My Own Research
 
 * [深入理解flannel](深入理解flannel.md)
 
+## Kubernetes Storage
+
+* [Kubernetes存储框架解析](Kubernetes存储框架解析.md)
+
 ## Service Mesh
 
 * [深入理解Istio核心组件之Pilot](深入理解Istio核心组件之Pilot.md)
