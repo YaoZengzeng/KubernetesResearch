@@ -24,11 +24,31 @@
 
 ![framework](./pic/storage/framework.png)
 
-我们知道，“资源对象+控制器”是Kubernetes架构体系的基础，对于存储的实现也不例外。存储相关的控制器会持续地对集群中存储相关的资源对象进行List/Watch并根据资源对象的增删改查做出相应的调整，例如，为PVC找到合适的PV进行绑定，根据策略对PV进行回收等等。如果真正需要操纵底层的存储资源，则通过标准的Volume Plugin进行实现。最后，我们对框架的主体，即控制器部分进行说明。已知存储框架的主要作用是能够基于用户的需求将存储挂载到指定的负载中，因此只要能够说明从PVC创建到存储挂载至Pod的整个过程，框架的结构自然也就清晰了。
+我们知道，“资源对象+控制器”是Kubernetes架构体系的基础，对于存储的实现也不例外。存储相关的控制器会持续地对集群中存储相关的资源对象进行List/Watch并根据资源对象的增删改查做出相应的调整，例如，为PVC找到合适的PV进行绑定，根据策略对PV进行回收等等。如果真正需要操纵底层的存储资源，则通过标准的Volume Plugin进行实现。最后，我们对框架的主体，即控制器部分进行说明。
 
+![./controller](./pic/storage/controller.png)
 
+如上图所示，存储相关的控制器主要为：PersistentVolume Controller，AttachDetach Controller，Kubelet，三者通过PV/PVC/SC/Pod/Node这五个资源对象进行交互，最终完成将用户指定的存储资源挂载到指定应用负载的任务。虽然随着整体架构的发展，各个Controller的存在形式（集成到Kube-Controller-Manager中或者以独立的方式运行）或者功能划分（Attach/Detach从Kubelet移动到AD Controller）会有所不同，但是一种存储类型要接入Kubernetes总是需要有相应的组件来完成类似的功能。下面就以上图为例，依次说明各个Controller在框架中所起的作用，一方面能够对整个框架的执行过程有一个宏观的了解，另一方面也能为后续两块内容：存储约束下的容器调度以及CSI奠定基础。
 
+#### PV Controller
 
+PV Controller主要包含两个逻辑处理单元：Claim Worker以及Volume Worker，它们基于标准的Kubernetes Controller模式分别对PVC和PV的Add/Update/Delete进行处理。不过PV/PVC这两个资源对象状态以及字段繁多，更由于两者之间存在绑定关系，因此无论是PV还是PVC的Add/Update/Delete都涉及大量边界条件的处理。所以下面将只对最核心的，即Unbound的PVC如何寻找合适的PV并与之绑定的过程，进行分析，从而能够对PV Controller的整体架构有着提纲挈领式的认识而不至于过度陷入细节而无法自拔（注：暂时不考虑Delay Binding的场景）。
+
+1. Claim Worker会对PVC的Add/Update事件或者定期的全量Resync进行处理。如果PVC的annotation中不包含Key为`pv.kubernetes.io/bind-completed`的键值对，则说明PVC仍未绑定。
+2. 遍历匹配所有已经存在的PV，根据AccessMode，VolumeMode，Label Selector，StorageClass以及Size等条件进行筛选，得到符合要求的PV，需要注意的是，在大小或者节点亲和性合适的情况，优先选择已经与该PVC提前绑定（pre-bound）的PV，即`Spec.Claim`字段与目标PVC完全匹配的PV。若不存在pre-bound且匹配的PV，则在剩余匹配的PV中选择Size最小的PV。
+3. 若未筛选到合适的现存的PV且PVC中指定了StorageClass，则根据对应StorageClass中指定的Provisioner找到对应的Volume Plugin进行Provision，真正创建存储资源并生成相应的PV对象。其中PV的`Spec.ClaimRef`字段会用PVC对应的内容进行填充，从而保证在下一次同步过程的步骤2中，该PVC和PV能优先绑定。
+4. 不论PVC通过静态查找还是动态生成找到了匹配的PV，则在两个资源对象中同时填入对方的信息，添加一些annotations以及将状态转变为`Bound`，表示二者已经绑定。否则，PVC处于`Pending`状态，等待下一次的同步。
+
+总之，PV Controller用于对PV/PVC这两个资源对象的生命周期以及状态进行管理，简答地说，就是努力为PVC绑定最合适的PV。由于PV以及PVC之间的关联异常紧密，因此其中一个资源对象发生变化往往另一个相对的资源也需要做变更从而保持整体的一致性，这也在一定程度上增加了处理逻辑的复杂性，针对某个具体场景或者异常条件下的处理，建议直接分析源码，在此不再赘述。
+
+#### AD Controller
+
+AD Controller，即Attach/Detach Controller，包含如下核心组成部分：
+
+* DesiredStateOfWorld：
+* ActualStateOfWorld：
+* DesiredStateOfWorldPopulator
+* Reconciler：
 
 
 
