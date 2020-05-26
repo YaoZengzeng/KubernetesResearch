@@ -45,10 +45,22 @@ PV Controller主要包含两个逻辑处理单元：Claim Worker以及Volume Wor
 
 AD Controller，即Attach/Detach Controller，包含如下核心组成部分：
 
-* DesiredStateOfWorld：
-* ActualStateOfWorld：
-* DesiredStateOfWorldPopulator
-* Reconciler：
+* DesiredStateOfWorld（DSW）：通过字面就能知道DSW是对于Volume附着（Attach）情况的目标状态的描述，保存了关于哪些Volume应该附着到哪些Node并且被哪些Pod使用的信息
+* ActualStateOfWorld（ASW）：与DSW相对，ASW描述的是Volume的实际附着情况，即哪些Volume已经附着到哪些Node上了
+* DesiredStateOfWorldPopulator（DSWP）：一般Volume应该附着到哪个Node是由引用该Volume的Pod决定的。因此DSWP的作用就是根据当前集群中相关Pod的调度情况填充DSW
+* Reconciler：基于DSW和ASW的差异调用相应的Volume Plugin进行Attach或者Detach，使DSW和ASW保持一致，最终让所有的Volume都安装期望附着在相应的Node上
+
+![adcontroller](./pic/storage/adcontroller.png)
+
+AD Controller的架构如上所示，执行流程如下：
+
+1. 每个Node的`Status.VolumesAttached`字段表明该节点当前附着的Volumes，因此当AD Controller初始化时会遍历集群中所有的Node对象并利用该字段填充ASW。
+2. 每一个完成调度的Pod中都包含它运行的节点的信息以及它引用的Volume，因此DSWP会定期基于当前集群中所有Pod的状态对DSW进行更新，更新的过程一般为：1) 去除存在于DSW中但是事实上已经在集群中不存在的Pod，如果从DSW中清除的Pod是引用该节点某个Volume的最后一个Pod，那么该Volume也将失去和该节点的关联关系，表明该Volume不应该再附着到该节点， 2) 遍历当前集群中的所有Pod，将Pod以及Pod关联的Node以及Volume的信息写入DSW中，构成对Volume Attach的期望状态
+3. Reconciler对ASW和DSW进行调谐，使得Volume的实际附着情况与期望状态一致。步骤为：1) 遍历ASW中的所有Attached Volume，如果它不存在于DSW中，则调用底层对应的Volume Plugin将该Volume Detach并更新相应节点的`Status.VolumesAttached`字段， 2）遍历DSW中所有应该被附着的Volume，如果它不存在于ASW中则调用底层对应的Volume Plugin将该Volume Attach并更新相应节点的`Status.VolumesAttached`字段
+
+关于AD Controller架构的简要描述如上，简单地说就是分别从Pod中获取期望的Volume的附着状态，从Node中获取初始的、实际的Volume附着状态并不断在两者之间进行调谐。需要注意的是并不是所有的Volume类型都需要Attach/Detach，而且Attach/Detach操作事实上最初是封装在Kubelet中的，但是考虑到需要将Attach/Detach独立于节点的可用性并且在公有云场景下，对云盘的Attach/Detach往往意味着更大的操作权限，将它们下放到每个节点显然是不太合适的，因此最终独立出了AD Controller用于处理此类操作，具体可参加其[设计文档](https://github.com/kubernetes/kubernetes/issues/20262)。
+
+#### Kubelet
 
 
 
@@ -56,4 +68,5 @@ AD Controller，即Attach/Detach Controller，包含如下核心组成部分：
 
 * [Kubernetes源码](https://github.com/kubernetes/kubernetes)
 * [Kubernetes存储架构及插件使用](https://developer.aliyun.com/article/743613)
+* [Detailed Design For Volume Attach/Detach Controller](https://github.com/kubernetes/kubernetes/issues/20262)
 
