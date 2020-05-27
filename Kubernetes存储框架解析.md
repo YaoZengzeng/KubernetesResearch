@@ -48,7 +48,7 @@ AD Controller，即Attach/Detach Controller，包含如下核心组成部分：
 * DesiredStateOfWorld（DSW）：通过字面就能知道DSW是对于Volume附着（Attach）情况的目标状态的描述，保存了关于哪些Volume应该附着到哪些Node并且被哪些Pod使用的信息
 * ActualStateOfWorld（ASW）：与DSW相对，ASW描述的是Volume的实际附着情况，即哪些Volume已经附着到哪些Node上了
 * DesiredStateOfWorldPopulator（DSWP）：一般Volume应该附着到哪个Node是由引用该Volume的Pod决定的。因此DSWP的作用就是根据当前集群中相关Pod的调度情况填充DSW
-* Reconciler：基于DSW和ASW的差异调用相应的Volume Plugin进行Attach或者Detach，使DSW和ASW保持一致，最终让所有的Volume都安装期望附着在相应的Node上
+* Reconciler：基于DSW和ASW的差异调用相应的Volume Plugin进行Attach或者Detach，使DSW和ASW保持一致，最终让所有的Volume都按照期望附着在相应的Node上
 
 ![adcontroller](./pic/storage/adcontroller.png)
 
@@ -62,11 +62,29 @@ AD Controller的架构如上所示，执行流程如下：
 
 #### Kubelet
 
+Kubelet是Kubernetes中位于每个节点的Agent，负责对调度到该节点的Pod的生命周期进行管理，Kubelet用众多的Manager共同协作来完成这一任务，其中对存储进行管理的是Volume Manager。如果阅读过相关的代码就会发现Volume Manager的处理逻辑与AD Controller非常相似，它同样包含如下几个核心组成部分：
 
+* DesiredStateOfWorld（DSW）：与AD Controller中的DSW不同的是，Volume Manager中的DSW描述的是哪些Volume应该被附着（Attach）并且挂载（Mount）到本节点供运行其上的Pod使用
+* ActualStateOfWorld（ASW）：对于本节点Volume挂载情况的实际描述，即Volume Manager相信哪些Volume已经附着到本节点并已被成功挂载到引用它的Pod的相关目录
+* DesiredStateOfWorldPopulator（DSWP）：基于调度到当前节点的Pod的情况对DSW进行更新
+* Reconciler：基于DSW和ASW的差异调用相应的Volume Plugin进行Mount或者Unmount，使DSW和ASW保持一致，最终让所有的Volume都按照期望挂载到引用该Pod的对应目录（一般为`/var/lib/kubelet/pods/{podID}/volumes/{volume plugin}/{volume name}`）
+
+VolumeManager与AD Controller的执行过程也非常相似：
+
+* DSWP定期执行对DSW进行更新，如果DSW中的Volume对应的Pod已经不存在了，则将该Pod以及Volume的关联关系从DSW中移除，如果有新的Pod被调度到本节点，则将该Pod和它引用的Volume加入DSW中
+* Reconciler定期对ASW和DSW进行调谐，使得本节点Volume的挂载情况与期望状态一致。步骤为：1）遍历ASW中所有Mounted Volume（其实是一个二元组，包含Volume以及引用它的Pod，一个Volume可能被一个节点的多个Pod引用），如果它不存在于DSW中，则调用底层的Volume Pluin将该Volume从相应Pod的挂载目录卸载，2）遍历DSW中所有应该被挂载的Volume，如果它不存在于ASW中，且该Volume还没有Attach到本节点并且该Volume对应的存储需要进行Attach操作，则等待直到本节点的`Node.Status.VolumesAttached`字段包含这个Volume，最后调用底层的Volume Plugin，将Volume挂载到对应Pod的挂载目录（对于有的存储类型，可能需要先挂载到一个全局目录再`Bind Mount`到Pod的挂载目录），3）遍历ASW中所有Unmounted Volume（所谓Unmounted Volume是指附着到本节点但是已经没有Pod引用的Volume），如果它是需要先挂载到全局的Volume类型，则先将其从全局目录中卸载，最后将它从ASW中移除
+
+需要注意的是，如上文所述，最初其实是由Kubelet来执行Attach/Detach操作的，而最终是由谁来执行该操作会根据每个节点的Kubelet的配置不同而不同。如果一个节点的Kubelet的启动参数中，`enable-controller-attach-detach`为true，则该节点的Attach/Detach操作由AD Controller执行，否则该节点由Kubelet进行该操作。如果是后者，则Volume Manager的Reconciler在上文的步骤2中，则应该主动执行Attach操作，包括在第三步中进行Detach，而不应该等待本节点的`Node.Status.VolumesAttached`发送变更。
+
+综上即是Kubernetes存储框架的概要描述，简单地说就是PV Controller根据PVC找到或者创建合适的PV进行绑定，AD Controller（或者Kubelet）有必要的话，将相应的Volume附着到引用该Volume的Pod被调度到的节点上，最后该节点的Kubelet将Volume挂载到引用该Pod的相应的目录。不过，接下来我们也将看到根据底层存储的不同，整个框架的执行过程乃至各个组件的作用都会发生一定的变化，尤其是在引入CSI之后，但这也仅仅是对上述框架进行的扩展。有了上面这个“原始”框架的铺垫，后面的内容理解起来应该不至于太过困难。
 
 ### 参考链接
 
 * [Kubernetes源码](https://github.com/kubernetes/kubernetes)
 * [Kubernetes存储架构及插件使用](https://developer.aliyun.com/article/743613)
 * [Detailed Design For Volume Attach/Detach Controller](https://github.com/kubernetes/kubernetes/issues/20262)
+* [Detailed Design for Volume Mount/Unmount Redesign](https://github.com/kubernetes/kubernetes/issues/21931)
+* [详解 Kubernetes Volume 的实现原理](https://draveness.me/kubernetes-volume/)
+
+
 
