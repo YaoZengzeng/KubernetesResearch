@@ -78,6 +78,47 @@ VolumeManager与AD Controller的执行过程也非常相似：
 
 综上即是Kubernetes存储框架的概要描述，简单地说就是PV Controller根据PVC找到或者创建合适的PV进行绑定，AD Controller（或者Kubelet）有必要的话，将相应的Volume附着到引用该Volume的Pod被调度到的节点上，最后该节点的Kubelet将Volume挂载到引用该Pod的相应的目录。不过，接下来我们也将看到根据底层存储的不同，整个框架的执行过程乃至各个组件的作用都会发生一定的变化，尤其是在引入CSI之后，但这也仅仅是对上述框架进行的扩展。有了上面这个“原始”框架的铺垫，后面的内容理解起来应该不至于太过困难。
 
+
+
+### 2. 存储拓扑与Pod调度
+
+从上文的分析来看，Pod的调度和存储资源（PV）的创建过程是平行的，两者可以异步执行。这个结论的前提是，存储对于所有节点都是平等的，无论Pod调度到哪个节点，PV对应的存储资源都能被该节点的Pod使用。但是现实不会如此美好，存储往往是存在拓扑限制的，即存储资源只能被集群中的某些节点使用。因此存储拓扑与Pod的调度往往是会相互影响的，一般会反映为如下两个问题：
+
+* Pod在调度过程中需要考虑已有的存储拓扑结构
+* 对于某些存储资源类型，PV Controller需要根据Pod的调度结果生成合适的PV以及对应的底层存储资源
+
+#### 问题一
+
+这个问题显然需要通过扩展Kubernetes的调度器实现，将系统当前的存储拓扑结构纳入调度的约束条件。已知Kubernetes的调度器主要可以分为Predicate和Priority，前者用于筛选出符合调度条件的节点，后者用于在符合条件的节点中挑选出最优解。这里我们只需要扩展Predicate阶段，增加存储相关的筛选过程即可。当前内置的存储相关的筛选过程包括：VolumeZonePredicate、CSIMaxVolumeLimitPredicate、VolumeBindingPredicate等等。这里着重对VolumeBindingPredicate进行说明，它的主要作用在于判断当前节点是否能满足该Pod所有PVC/PV对Node Affinity的要求。其具体执行过程如下：
+
+1. 获取对应Pod所有PVC的绑定情况，主要分为以下三类：
+   1. BoundClaims：已经处于Bound状态的PVC，所谓的Bound是指PVC已经引用了相应的PV并且该PVC的annotations中包含键值对"pv.kubernetes.io/bind-completed": "true"
+   2. UnboundClaims：PVC未引用任何PV且对应的StorageClass的VolumeBindingMode为`WaitForFirstConsumer`，即延迟绑定，通过下文可以了解到，利用这种绑定类型即可解决本节中的第二个问题
+   3. UnboundClaimsImmediate：其他应当处于Bound状态而未处于该状态的PVC
+2. 如果存在UnboundClaimsImmediate，则该Pod此次调度失败，因为一旦后续UnboundClaimsImmediate中的PVC绑定之后，PVC的Node Affinity可能会与调度结果发生冲突
+3. 遍历BoundClaims对应PV的NodeAffinity，如果存在不匹配的情况，则Pod不能调度到当前节点
+4. 如果UnboundClaims中存在当前节点现有的PV不能满足且不支持动态Provision的PVC，则Pod同样不能调度到当前节点
+5. 最后，如果当前节点能够满足步骤2~4的筛选，则可以进入下一个Predicate过程
+
+上述是Kubernetes内置的基于存储拓扑对可调度节点的筛选，事实上对于某些有着特殊要求的存储资源类型，原生的Kubernetes调度器是不够的，我们往往需要利用`Scheduler Extender`等机制来进一步扩展存储拓扑对调度过程的影响，基于LVM的动态本地存储就涉及到了类似的[实现](https://github.com/cybozu-go/topolvm)。
+
+#### 问题二
+
+这个问题最典型的场景莫过于在公有云上一个集群跨多个可用区，但是存储不能跨可用区共享。因此必须在已知Pod调用结果的情况下才能在对应可用区创建相应的存储资源。而这个问题的解决方法已经在上面提到了，即将StorageClass的VolumeBindingMode设置为`WaitForFirstConsumer`。PV Controller也需要对此进行一定的扩展：
+
+* 当对未绑定的PVC进行同步时，首先判断该PVC是否需要延迟绑定，如果PVC对应的VolumeBindingMode为`WaitForFirstConsumer`且PVC的annotations中不包含Key为"volume.kubernetes.io/selected-node"的键值对，则跳过该PVC，暂不做处理
+* 延迟绑定的PVC需要等待相应的Pod调度成功，那么调度器必然需要某种机制通知PV Controller PVC相关的PV已经调度成功了。同步的方式也非常简单，一旦调度成功，Kubernetes就会在延迟调度的PVC打上一个Annotation，键为"volume.kubernetes.io/selected-node"，值为Pod调度到的节点。当PV Controller再次对未绑定的PVC进行同步时，如果发现PVC包含该annotation，则直接按照正常流程，寻找或者创建PV并与之绑定
+
+
+
+### 3. CSI协议分析
+
+
+
+
+
+
+
 ### 参考链接
 
 * [Kubernetes源码](https://github.com/kubernetes/kubernetes)
