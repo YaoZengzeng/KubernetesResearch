@@ -29,6 +29,8 @@ Some Analysis Articles Of Kubernetes Ecosystem Writing By My Own Research
 
 * [深入理解Istio核心组件之Pilot](深入理解Istio核心组件之Pilot.md)
 
+* [Istio安全框架解析](Istio安全框架解析.md)
+
 ## Prometheus
 
 * [Prometheus在Kubernetes下的服务发现机制](Prometheus在Kubernetes下的服务发现机制.md)
