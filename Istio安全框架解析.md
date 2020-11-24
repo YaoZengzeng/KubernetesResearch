@@ -226,11 +226,147 @@ spec:
 
 上述配置表示只对default这个namespace开启鉴权，即default内的所有服务默认不可访问，关于`ClusterRbacConfig`更复杂的配置参见官网。
 
-类比于Kubernetes中的RBAC，若要放开对于某些服务的访问权限，需要配置相应的`ServiceRole`和`ServiceRoleBinding`，不难理解，`ServiceRole`用于定义一系列的权限而`ServiceRoleBinding`则将`ServiceRole`表示的权限授予特定的对象。
+类比于Kubernetes中的RBAC，若要放开对于某些服务的访问权限，需要配置相应的`ServiceRole`和`ServiceRoleBinding`，不难理解，`ServiceRole`用于定义一系列的权限而`ServiceRoleBinding`则将`ServiceRole`表示的权限授予特定的对象，两者的示例如下：
+
+```yaml
+apiVersion: "rbac.istio.io/v1alpha1"
+kind: ServiceRole
+metadata:
+  name: products-viewer
+  namespace: default
+spec:
+  rules:
+  - services: ["products.default.svc.cluster.local"]
+    methods: ["GET"]
+```
+
+上述`ServiceRole`表示能够用'GET'方法访问default namespace下的products service
+
+```yaml
+apiVersion: "rbac.istio.io/v1alpha1"
+kind: ServiceRoleBinding
+metadata:
+  name: binding-products-allusers
+  namespace: default
+spec:
+  subjects:
+  - user: "*"
+  roleRef:
+    kind: ServiceRole
+    name: "products-viewer"
+```
+
+上述`ServiceRoleBinding`则表示将'product-views'代表的权限授予任何用户，包括已认证的和非认证的。
+
+同样，控制面组件Pilot会将上述`ServiceRole`等鉴权相关的上层抽象资源转换为控制面代理Envoy的配置。每个Envoy中都内置了一个authorization engine用于在运行时对请求进行处理，决定允许或者拒绝对对应服务的访问。最终，Envoy用Inbound listener filter chain中一个额外的名为"envoy.filters.http.rbac"的HTTP filter来承载上文鉴权相关的配置：
+
+```
+{
+ "name": "envoy.filters.http.rbac",
+ "typed_config": {
+  "@type": "type.googleapis.com/envoy.config.filter.http.rbac.v2.RBAC",
+  "rules": {
+   "policies": {
+    "productpage-viewer": {
+     "permissions": [
+      {
+       "and_rules": {
+        "rules": [
+         {
+          "or_rules": {
+           "rules": [
+            {
+             "header": {
+              "name": ":method",
+              "exact_match": "GET"
+             }
+            }
+           ]
+          }
+         }
+        ]
+       }
+      }
+     ],
+     "principals": [
+      {
+       "and_ids": {
+        "ids": [
+         {
+          "any": true
+         }
+...
+```
+
+需要注意的是，如果目标服务所在的namespace没有开启鉴权的，上面的RBAC HTTP filter是不会存在的（因为无所有服务默认都可以访问），而在开启鉴权的情况下，如果没有创建对应的`ServiceRole`以及`ServiceRoleBinding`，则RBAC HTTP filter的规则列表为空，也就表示该Envoy代理的输入流量的目标服务完全不允许访问：
+
+```json
+{
+ "name": "envoy.filters.http.rbac",
+ "typed_config": {
+  "@type": "type.googleapis.com/envoy.config.filter.http.rbac.v2.RBAC",
+  "rules": {}
+ }
+}
+```
+
+总的来说，Istio提供了细粒度的权限访问控制并且配置方法也较为简单，对于更为复杂的授权策略可以参加官网的说明。
 
 
 
 ### 4. 证书获取机制及其演进过程
+
+已知在Kubernetes环境下，Istio将Pod绑定的Service Account作为其标识。默认情况下，Citadel会监听集群中Service Account并为其生成对应的私钥以及证书并创建类型为`istio.io/key-and-cert`的secret用于保存：
+
+```bash
+[root@physical-56 yzz]# kubectl  get sa 
+NAME                   SECRETS   AGE
+bookinfo-details       1         26h
+bookinfo-productpage   1         26h
+default                1         5d4h
+[root@physical-56 yzz]# kubectl  get secret 
+NAME                                           TYPE                                  DATA   AGE
+bookinfo-details-token-njnts                   kubernetes.io/service-account-token   3      26h
+bookinfo-productpage-token-6pwnk               kubernetes.io/service-account-token   3      26h
+default-token-mfwwk                            kubernetes.io/service-account-token   3      5d4h
+istio.bookinfo-details                         istio.io/key-and-cert                 3      26h
+istio.bookinfo-productpage                     istio.io/key-and-cert                 3      26h
+istio.default                                  istio.io/key-and-cert                 3      28h
+```
+
+当创建Pod并将其加入网格，在注入sidecar的同时，Istio会将该Pod绑定的Service Account对应的secret挂载至Pod中：
+
+```bash
+[root@physical-56 yzz]# kubectl  describe pods productpage-v1-59984c8fb5-27lp7
+Name:         productpage-v1-59984c8fb5-27lp7
+Namespace:    default
+Priority:     0
+Node:         192.168.132.14/192.168.132.14
+Start Time:   Mon, 23 Nov 2020 17:23:41 +0800
+Labels:       app=productpage
+              pod-template-hash=59984c8fb5
+              version=v1
+...
+  istio-proxy:
+    Port:          15090/TCP
+    Host Port:     0/TCP
+    Args:
+      proxy
+      sidecar
+      --domain
+...
+    Mounts:
+      /etc/certs/ from istio-certs (ro)
+      /etc/istio/proxy from istio-envoy (rw)
+      /var/run/secrets/kubernetes.io/serviceaccount from bookinfo-productpage-token-6pwnk (ro)
+Volumes:
+  istio-certs:
+    Type:        Secret (a volume populated by a Secret)
+    SecretName:  istio.bookinfo-productpage
+    Optional:    true
+...
+
+```
 
 
 
