@@ -32,7 +32,62 @@ Cluster子系统负责维护所有clusters以及对应的endpoints信息，它�
 
 
 
+#### 建立listener
+
+`ListenerManagerImpl`首先基于listener的配置信息构建出`ListenerImpl`对象，该对象提供了Listener的配置接口（`Network::ListenerConfig`）以及创建各种filter chain的接口（`Network::FilterChainFactory`）。`ListenerImpl`提供的主要接口如下：
+
+```c++
+// 负载均衡接口，ActiveTcpListener在构造时会通过本接口进行注册，
+// 当ActiveTcpListener接收到连接时，必要时，会调用本接口，将连接转发到负载最小的ActiveTcpListener
+virtual ConnectionBalancer& connectionBalancer() PURE;
+
+// listener socket的创建接口
+virtual ListenSocketFactory& listenSocketFactory() PURE;
+```
+
+
+
+之后`ListenerManagerImpl`会将`ListenerImpl`依次加入到各个worker中，最终调用的是`ConnectionHandlerImpl`的`addListener()`函数，假设添加的listener监听的TCP并且该listener之前并不存在，则会创建一个`ActiveTcpListener`对象，显然，`ActiveTcpListener`是每个worker自有的。该对象提供的主要接口如下：
+
+```c++
+// 提供给Network::TcpListenerImpl的回调函数，在接收到连接的时候被调用，
+// 经过判断是否超过listener的连接上限并且负载均衡之后，创建ActiveTcpSocket对象并在其上构建
+// 并且遍历listener filter chains
+void onAccept(Network::ConnectionSocketPtr&& socket);
+```
+
+在`ActiveTcpListener`的构造函数中，调用dispatcher创建`TcpListenerImpl`对象，`TcpListenerImpl`真正对listener socket的事件进行监听。
+
 ### 3. 请求处理
+
+#### 3.1 建立连接
+
+到有连接事件到达时，回调函数`TcpListenerImpl::onSocketEvent()`获取底层的connection socket并构建`AcceptedSocketImpl`对象，并回调`ActiveTcpListener::onAccept()`函数。`onAccept()`函数在接收到连接之后会进行前置的判断，比如连接数是否超过了 listener的配置的上限，对连接进行负载均衡，找到负载最小的`ActiveTcpListener`，最后基于socket构建`ActiveTcpSocket`对象并调用`ListenerImpl.filterChainFactory().createListenerFilterChain()`在`ActiveTcpSocket`之上构建listener filter chain并调用`ActiveTcpSocket::continueFilterChain()`。`ActiveTcpSocket`的主要接口如下：
+
+```c++
+// 遍历listener filter chain，完成之后调用newConnection()
+void continueFilterChain(bool success) override;
+
+// 如果连接是经过iptables重定向的，则需要根据原先的目的地址找到真正的ActiveTcpListener，
+// 调用ActiveTcpListener::onAcceptWorker()函数，将上文的步骤再执行一遍，最后还是调用本函数，
+// 最终调用ActiveStreamListenerBase::newConnection()
+void ActiveTcpSocket::newConnection();
+```
+
+`ActiveStreamListenerBase`其实是`ActiveTcpListener`的父类，其主要接口如下：
+
+```c++
+// 基于socket的信息，调用ListenerImpl的filterChainManager获取匹配的filter chain，
+// 调用filter chain的transportSocketFactory()接口创建transport socket，
+// 接着调用dispatcher的createServerConnection()，真正构建server connection，
+// 即Network::ServerConnectionImpl，最终，调用ActiveTcpListener::newActiveConnection()，
+// 构建filter chain和connection之间的映射并保存在ActiveTcpListener中
+void newConnection(Network::ConnectionSocketPtr&& socket, ...);
+```
+
+`Network::ServerConnectionImpl`继承自`Network::ConnectionImpl`函数，`Network::ConnectionImpl`真正对socket的读写事件进行处理。
+
+#### 3.2 请求处理
 
 
 
