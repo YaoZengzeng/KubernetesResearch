@@ -117,6 +117,141 @@ Envoy整体的请求处理框架如上所示，至于具体的处理细节会在
 
 #### 3.3 tcp_proxy处理流程分析
 
+`tcp_proxy`的初始化分为两部分，第一部分是在Filter的构造函数中，主要初始化了其中的`config_`，`cluster_manager_`，`downstream_callbacks_`以及`upstream_callback_`这几个对象，第二部分的初始化则由`Filter::initializeReadFilterCallbacks`完成，主要用于初始化`read_callbacks_`对象并且将`downstream_callbacks_`加入到downstream connection中，用于响应来自downstream connection的事件。`tcp_proxy` filter中各主要字段及其功能如下：
+
+```c++
+// 该tcp_proxy filter的配置
+const ConfigSharedPtr config_;
+// 根据配置获取目标cluster的信息
+Upstream::ClusterManager& cluster_manager_;
+// 主要用于获取downstream connection的信息
+Network::ReadFilterCallbacks* read_callbacks_{};
+// 对于downstream connection的事件处理函数
+DownstreamCallbacks downstream_callbacks_;
+// 对于upstream connection的事件处理函数，与一般的Network::ConnectionCallbacks
+// 相比，主要扩展了onUpstreamData(...)方法，处理来自upstream的数据，通常情况下都是
+// 直接调用tcp_proxy的onUpstreamData函数
+std::shared_ptr<UpstreamCallbacks> upstream_callbacks_;
+// 连接池配置
+std::unique_ptr<GenericConnPool> generic_conn_pool_;
+```
+
+`tcp_proxy`同样符合一般的network filter的处理流程，当downstream connection刚刚建立时，会调用它的`onNewConnection()`函数，而有downstream的数据需要处理时，则会调用它的`onData()`函数。另外，函数`onUpstreamData()`处理来自upstream的数据。`tcp_proxy` filter的主要接口如下：
+
+```c++
+// 对新的downstream connection进行处理，如果config_中设置了downstream connection最大的
+// 连接超时时间，则进行处理，之后直接调用initializeUpstreamConnection()
+Network::FilterStatus Filter::onNewConnection()
+// 初始化upstream connection，首先路由获取目标cluster，不过和http流量的路由处理相比，tcp流量
+// 要简单得多，一般会在配置中直接指定目标cluster，从cluster_manager_获取对应的thread_local_cluster
+// 之后，再经过一系列的配置，最终调用maybeTunnel()函数
+Network::FilterStatus Filter::initializeUpstreamConnection()
+// 获取连接池工厂，根据配置创建一个连接池，即generic_conn_pool_，最后调用
+// generic_conn_pool_->newStream(*this)真正在连接池中创建/获取连接
+bool Filter::maybeTunnel(Upstream::ThreadLocalCluster& cluster)
+// 连接池创建upsream connection失败，则回调此函数
+void Filter::onGenericPoolFailure(...)
+// 连接池创建upstream connection成功，则回调此函数，对upstream_进行赋值，打开downstream
+// connection的readDisable()并且调用network filter manager的onContinueReading()继续
+// 对network filter进行遍历
+void Filter::onGenericPoolReady(...)
+// 处理来自downstream connection的数据，直接写入upstream_即可，如果它已经被赋值了的话
+Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream)
+// 处理来自upstream connection的数据，直接写入downstream connection，
+// read_callbacks_->connection().write()即可
+void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream)
+```
+
+现在我们来关注连接池的创建，首先会构建一个名为`TcpConnPool`的对象，不过这个对象的作用更多的是功能的适配，用于衔接`tcp_proxy` filter的接口和真正的连接池实例的接口，`TcpConnPool`的主要接口如下：
+
+```C++
+// 构造函数，调用thread_local_cluster真正创建连接池并保存在conn_pool_data_中
+TcpConnPool(Upstream::ThreadLocalCluster& thread_local_cluster, ...)
+// 通用TCP连接池的回调函数，直接转发调用callbacks_，即tcp_proxy filter
+// 的onGenericPoolFailure()函数
+void onPoolFailure(ConnectionPool::PoolFailureReason reason, ...)
+// 通用TCP连接池的回调函数，构建TcpUpstream并转发给tcp_proxy filter的onGenericPoolReady()
+void onPoolReady(Tcp::ConnectionPool::ConnectionDataPtr&& conn_data, ...)
+// 直接调用conn_pool_data_创建新的连接
+void newStream(GenericConnectionPoolCallbacks& callbacks)
+```
+
+需要注意的是，为什么不让`tcp_proxy`直接适配TCP连接池的回调接口，而用`TcpConnPool`进行转发，原因是`tcp_proxy`可以配置隧道，即利用HTTP连接池代理TCP连接。因此`tcp_proxy`的接口为`onGenericPoolReady()`，通过`TcpConnPool`和`HttpConnPool`进行转换，从而既能适配TCP，也能适配HTTP连接池的回调接口。
+
+最终`thread_local_cluster`创建类型为`Tcp::ConnPoolImpl`的连接池，事实上`Tcp::ConnPoolImpl`是对`Envoy::ConnectionPool::ConnPoolImplBase`的封装，该结构被TCP连接池和HTTP连接共用，实现连接池的通用核心逻辑。下面，我们先来看`Tcp::ConnPoolImpl`的主要接口：
+
+```c++
+// 将callbacks（即上文的TcpConnPool）封装进TcpAttachContext结构，调用newStreamImpl()函数
+ConnectionPool::Cancellable* newConnection(Tcp::ConnectionPool::Callbacks& callbacks)
+// 当连接池中没有可用连接时，将stream封装为pending stream，需要注意的是，pending stream保存在
+// 底层的ConnPoolImplBase中
+ConnectionPool::Cancellable* newPendingStream(Envoy::ConnectionPool::AttachContext& context)
+// 构造ActiveTcpClient，在该构造函数中真正调用底层接口真正创建连接
+Envoy::ConnectionPool::ActiveClientPtr instantiateActiveClient()
+// 从context中解析出callbacks，即TcpConnPool，调用它的onPoolReady()接口
+// 并且将ActiveTcpClient和Network::ClientConnection打包成TcpConnectionData
+// 作为参数传入
+void onPoolReady(...ActiveClient& client,...AttachContext& context)
+// 直接调用TcpConnPool的onPoolFailure()接口
+void onPoolFailure()
+```
+
+`ConnPoolImplBase::newStreamImpl(AttachContext& context)`真正用于串联downstream和upstream，如果连接池中有合适的连接，则调用`ConnPoolImplBase::attachStreamToClient(client, context)`将上下游进行关联，否则调用`newPendingStream(context)`将downstream的相关信息先保存起来，再调用`ConnPoolImplBase::tryCreateNewConnections()`异步创建连接。`ConnPoolImplBase`的主要字段如下：
+
+```c++
+// 一系列处于各种状态的clients
+std::list<ActiveClientPtr> ready_clients_;
+std::list<ActiveClientPtr> busy_clients_;
+std::list<ActiveClientPtr> connecting_clients_;
+// 一系列的pending streams
+std::list<PendingStreamPtr> pending_streams_;
+```
+
+`ConnPoolImplBase`的主要接口如下：
+
+```c++
+// 如果ready_clients_非空，则调用attachStreamToClient将上下游进行关联，
+// 否则调用newPendingStream()构建pending stream并调用tryCreateNewConnections()
+// 异步创建连接
+ConnectionPool::Cancellable* ConnPoolImplBase::newStreamImpl(AttachContext& context)
+// 进行一系列是否需要创建新连接的判断，如果真的需要，则调用instantiateActiveClient()
+ConnPoolImplBase::ConnectionResult ConnPoolImplBase::tryCreateNewConnection(...)
+// 本函数在ConnPoolImplBase中是纯虚函数，对于TCP连接池则创建ActiveTcpClient对象
+Envoy::ConnectionPool::ActiveClientPtr instantiateActiveClient()
+// 进行client的状态以及一些监控指标的更新，最后调用onPoolReady()
+void attachStreamToClient(...ActiveClient& client,AttachContext& context)
+// 纯虚函数，ConnPoolImplBase不实现
+void onPoolFailure(...)
+void onPoolReady(...)
+// 对于upstream connection的事件处理，当为Connected事件时，转换client状态并且
+// 调用onUpstreamReady()函数
+void ConnPoolImplBase::onConnectionEvent(ActiveClient& client, absl::string_view failure_reason, Network::ConnectionEvent event)
+// 匹配pending_streams_和ready_clients_，调用attachStreamToClient()
+// 如果还有多余的pending_stream_，则再调用tryCreateNewConnections()创建新连接
+void ConnPoolImplBase::onUpstreamReady()
+```
+
+`ActiveTcpClient`在构造函数中调用`host->createConnection(...)`真正创建底层连接并调用`connection_->addConnectionCallbacks(*this)`在连接中注册事件处理函数。它的主要接口如下：
+
+```C++
+// 构造函数，创建底层的upstream连接并且注册事件处理函数
+// 另外构造ConnReadFilter对象，将它作为read filter加入upstream connection中，
+// 用于接收来自upstream connection的数据，最终调用ActiveTcpClient::onUpstreamData()函数
+ActiveTcpClient::ActiveTcpClient(...ConnPoolImplBase& parent,...HostConstSharedPtr& host, uint64_t concurrent_stream_limit)
+// 底层upstream连接的事件处理函数，一般为调用parent，即ConnPoolImplBase的onConnectionEvent(...)
+// 函数
+void ActiveTcpClient::onEvent(Network::ConnectionEvent event)
+// 处理来自upstream connection的数据，如果callbacks_字段不为空，则调用它的onUpstreamData函数
+void onUpstreamData(Buffer::Instance& data, bool end_stream)
+```
+
+最后，总结`tcp_proxy`创建upstream connection并进行数据传输的步骤如下：
+
+1. 调用`TcpConnPool::newStream()`试着异步创建upstream connection
+2. 当upstream connection处于ready状态时，通过层层的`onPoolReady()`回调，最终调用到`TcpConnPool::onPoolReady`，将upstream的connection以及`ActiveTcpClient`都封装至`TcpUpstream`中，其中最为重要的是将`upstream_callbacks_`注册到`ActiveTcpClient`中，从而能串联`onUpstreamData`函数对于来自upstream connection的数据的流转
+3. `tcp_proxy`的`onData()`函数处理来自downstream connection的数据，最终调用`upstream_->encodeData（）`将数据转发到upstream connection
+4. `tcp_proxy`的`onUpstreamData()`函数处理来自upstream connection的数据，最终调用`read_callbacks_->connection().write()`将数据转发到downstream connection
+
 
 
 ### 参考文献
