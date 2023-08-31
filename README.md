@@ -33,6 +33,8 @@ Some Analysis Articles Of Kubernetes Ecosystem Writing By My Own Research
 
 * [Envoy核心架构分析](Envoy核心架构分析.md)
 
+* [Istio数据面新模式 --- Ambient Mesh](Istio数据面新模式---AmbientMesh.md)
+
 ## Prometheus
 
 * [Prometheus在Kubernetes下的服务发现机制](Prometheus在Kubernetes下的服务发现机制.md)
