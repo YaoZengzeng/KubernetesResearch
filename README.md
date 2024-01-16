@@ -37,6 +37,8 @@ Some Analysis Articles Of Kubernetes Ecosystem Writing By My Own Research
 
 * [Envoy Gateway概览](EnvoyGateway概览.md)
 
+* [Gateway API概览](GatewayAPI概览.md)
+
 ## Prometheus
 
 * [Prometheus在Kubernetes下的服务发现机制](Prometheus在Kubernetes下的服务发现机制.md)
